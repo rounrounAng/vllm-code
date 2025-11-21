@@ -162,7 +162,7 @@ class Qwen3NextConfig(PretrainedConfig):
 
     model_type = "qwen3_next"
     keys_to_ignore_at_inference = ["past_key_values"]
-
+    # 张量并行策略，每个权重矩阵如何在多个GPU间切分
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
@@ -178,6 +178,7 @@ class Qwen3NextConfig(PretrainedConfig):
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
     }
+    # 流水线并行计划，模型不同部分之间的数据流接口
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),

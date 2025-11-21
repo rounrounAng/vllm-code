@@ -60,9 +60,12 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # 批次索引、值头索引
     i_n, i_hv = i_nh // HV, i_nh % HV
+    # 计算查询/键头索引
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
+        # 可变长度处理逻辑
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),
             tl.load(cu_seqlens + i_n + 1).to(tl.int64),
@@ -76,7 +79,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     if T == 0:
         # no tokens to process for this sequence
         return
-
+    
+    # 键/查询维度的偏移
+    # i_k * all: 当前键块在所有序列中的偏移
+    # bos: 加上当前序列的开始位置
+    # * HV: 乘以值头数
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
@@ -122,28 +129,29 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-
+        # L2归一化
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
             b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q = b_q * scale
-        # [BK, BV]
+        # [BK, BV]门控计算
         if not IS_KDA:
             b_g = tl.load(p_g).to(tl.float32)
             b_h *= exp(b_g)
         else:
             b_gk = tl.load(p_gk).to(tl.float32)
             b_h *= exp(b_gk[:, None])
-        # [BV]
+        # [BV],Delta更新，计算当前值与历史状态的差异
         b_v -= tl.sum(b_h * b_k[:, None], 0)
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
+        # beta和Delta乘积    
         b_v *= b_beta
-        # [BK, BV]
+        # [BK, BV],更新t时刻值
         b_h += b_k[:, None] * b_v[None, :]
-        # [BV]
+        # [BV],最后乘以q
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 

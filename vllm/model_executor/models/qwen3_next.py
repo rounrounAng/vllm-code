@@ -274,12 +274,15 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
+        # conv1其实是在滑动窗口内，每个元素乘以核并将乘积累加，可以用并行的线性层计算
+        # 输出维度为[conv_dim, conv_kernel_size]
         self.conv1d = ColumnParallelLinear(
             input_size=self.conv_kernel_size,
             output_size=self.conv_dim,
             bias=False,
             prefix=f"{prefix}.conv1d",
         )
+        # 将维度转换成[conv_dim, 1, conv_kernel_size]
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
@@ -293,6 +296,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             prefix=f"{prefix}.in_proj_qkvz",
         )
         # ba_proj doesn't support blockwise fp8 quantization.
+        # Linear 层都会被拆成多 GPU 并行执行
         self.in_proj_ba = ColumnParallelLinear(
             input_size=self.hidden_size,
             output_size=self.projection_size_ba,
@@ -395,7 +399,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             self.num_v_heads // self.num_k_heads,
             self.num_v_heads // self.num_k_heads,
         ]
-
+        # 根据某种映射规则重新分配为 Q, K, V, Z, B, A
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
         #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
@@ -445,14 +449,20 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        # 对应架构图中的Linear操作，得到QKVZ、BA
+        # [num_tokens, 2key_dim + 2value_dim]
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        # [num_tokens, 2*num_v_heads]
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        # 拆分成 6 个张量
         query, key, value, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba
         )
+        # 把 (num_heads × head_dim) 展平成一个大向量
         query, key, value = map(
             lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
         )
+        # 拼成 mixed_qkv，用于 fast-path Fused Attention kernel
         mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
@@ -525,11 +535,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         a = a[:num_actual_tokens]
 
         # 1. Convolution sequence transformation
+        # 处理权重的形状
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
+        # 将 mixed_qkv 按 spec/non-spec 拆分
         if spec_sequence_masks is not None:
+            # 这个batch里面既没有prefill阶段，也没有decodes阶段的token
+            # 这种情况出现在非流式、或者MTP draft 阶段生成 speculative tokens时
+            # 就按照
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
@@ -542,6 +557,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            # 对 spec 路径进行增量/在线卷积更新（适合 speculative decode 场景）
+            # 并把 mixed_qkv_spec 替换为经过因果 conv1d 处理后的张量
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -562,6 +579,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
+            # 全量卷积
             mixed_qkv_non_spec = causal_conv1d_fn(
                 mixed_qkv_non_spec_T,
                 conv_weights,
@@ -592,7 +610,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec
         )
-
+        # 计算门控和beta值
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
         if spec_sequence_masks is not None:
@@ -900,6 +918,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+         # RMSNorm，处理输入数据的归一化。
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -907,6 +926,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         self_attention_output = torch.empty_like(hidden_states)
+        # attention层，会根据默认配置，3层linear_attention和1层full_attention
         if self.layer_type == "linear_attention":
             self.linear_attn(
                 hidden_states=hidden_states,
@@ -933,7 +953,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
 
         # Fully Connected
+        # 输出层RMSNorm 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # MOE层，会根据条件启用稀疏MOE,详见init函数
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -1308,7 +1330,7 @@ def gdn_attention_core_fake(
     """Fake implementation for torch.compile."""
     return
 
-
+# 注册为gdn_attention_core
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
@@ -1331,22 +1353,30 @@ def fused_gdn_gating_kernel(
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
 ):
+    # 获取线程块 ID
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # 当前线程块处理的所有头索引
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    # 当前线程处理元素在全局内存中的位置
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    # 防止越界访问
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
     blk_a = tl.load(a + off, mask=mask)
     blk_b = tl.load(b + off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     # If the model is loaded in fp16, without the .float() here, A might be -inf
+    # x = a + bias，添加偏置项
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    # softplus(x) = (1/β) * log(1 + exp(β * x))
     softplus_x = tl.where(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
+    # g = -exp(A_log) * softplus(a + bias)
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
     # compute beta_output = sigmoid(b)
+    # sigmoid 激活函数
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
     tl.store(
         beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
